@@ -1,0 +1,132 @@
+# Example 2: KEDA Scaling Based on Prometheus Custom Metrics
+# Shows how to use Prometheus queries as the basis for scaling (suitable for AI inference scenarios)
+
+---
+apiVersion: grove.io/v1alpha1
+kind: PodCliqueSet
+metadata:
+  name: prometheus-scaling
+spec:
+  replicas: 1
+  template:
+    cliques:
+    - name: inference
+      spec:
+        roleName: inference
+        replicas: 2
+        podSpec:
+          containers:
+          - name: inference
+            image: nginx:latest
+            ports:
+            - containerPort: 8080
+              name: metrics
+            resources:
+              requests:
+                cpu: 500m
+                memory: 1Gi
+
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: prometheus-scaling-scaler
+spec:
+  scaleTargetRef:
+    apiVersion: grove.io/v1alpha1
+    kind: PodClique
+    name: prometheus-scaling-0-inference
+  
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  pollingInterval: 30
+  cooldownPeriod: 120
+  
+  # Advanced scaling behavior configuration
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300    # Observe for 5 minutes before scaling down
+          policies:
+          - type: Percent
+            value: 50                         # Scale down by at most 50% each time
+            periodSeconds: 60
+          - type: Pods
+            value: 1                          # Scale down by at least 1 pod each time
+            periodSeconds: 60
+          selectPolicy: Min                   # Choose the most conservative policy
+        scaleUp:
+          stabilizationWindowSeconds: 0       # Scale up takes effect immediately
+          policies:
+          - type: Percent
+            value: 100                        # Scale up by at most 100% (double) each time
+            periodSeconds: 30
+          - type: Pods
+            value: 4                          # Scale up by at most 4 pods each time
+            periodSeconds: 15
+          selectPolicy: Max                   # Choose the most aggressive policy
+  
+  triggers:
+  # Trigger 1: Based on request rate
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc:9090
+      metricName: request_rate_per_pod
+      query: |
+        sum(rate(http_requests_total{
+          pod=~"prometheus-scaling-0-inference-.*"
+        }[2m])) / count(up{pod=~"prometheus-scaling-0-inference-.*"})
+      threshold: "100"              # Scale up when each pod exceeds 100 req/s
+      activationThreshold: "10"     # Can scale down when below 10 req/s
+      ignoreNullValues: "true"      # Ignore cases where Prometheus has no data
+  
+  # Trigger 2: Based on queue depth
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc:9090
+      metricName: queue_depth
+      query: |
+        avg(inference_queue_depth{
+          namespace="default",
+          clique="inference"
+        })
+      threshold: "50"               # Scale up when average queue depth exceeds 50
+      activationThreshold: "5"      # Can scale down when below 5
+      ignoreNullValues: "true"
+
+---
+# Example: ServiceMonitor for simulating metrics (if using Prometheus Operator)
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: prometheus-scaling-metrics
+spec:
+  selector:
+    matchLabels:
+      grove.io/app-name: prometheus-scaling-0-inference
+  endpoints:
+  - port: metrics
+    interval: 30s
+    path: /metrics
+
+---
+# Verification Steps:
+# 1. Ensure Prometheus is installed and accessible
+#    kubectl get svc -n monitoring prometheus-kube-prometheus-prometheus
+# 
+# 2. Deploy the example
+#    kubectl apply -f 02-prometheus-scaling.yaml
+# 
+# 3. View ScaledObject status
+#    kubectl describe scaledobject prometheus-scaling-scaler
+# 
+# 4. Check if KEDA can query Prometheus
+#    kubectl logs -n keda deployment/keda-operator | grep prometheus
+# 
+# 5. Simulate metrics (in actual use, the application will automatically expose these metrics)
+#    # You can use prometheus-pushgateway to push test metrics
+# 
+# 6. Watch scaling
+#    kubectl get pclq prometheus-scaling-0-inference -w
+

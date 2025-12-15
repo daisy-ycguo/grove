@@ -1,0 +1,233 @@
+# Example 7: PodCliqueScalingGroup Scaling
+# Shows how to use KEDA to scale an entire PodCliqueScalingGroup
+# This is very useful for multiple PodCliques that need coordinated scaling (e.g., prefill+decode)
+
+---
+apiVersion: grove.io/v1alpha1
+kind: PodCliqueSet
+metadata:
+  name: disaggregated-inference
+spec:
+  replicas: 1
+  template:
+    cliques:
+    # Prefill leader
+    - name: prefill-leader
+      spec:
+        roleName: prefill-leader
+        replicas: 1
+        podSpec:
+          containers:
+          - name: prefill-leader
+            image: nginx:latest
+            resources:
+              requests:
+                cpu: "2"
+                memory: "4Gi"
+    
+    # Prefill workers
+    - name: prefill-worker
+      spec:
+        roleName: prefill-worker
+        replicas: 4
+        podSpec:
+          containers:
+          - name: prefill-worker
+            image: nginx:latest
+            resources:
+              requests:
+                cpu: "4"
+                memory: "8Gi"
+    
+    # Decode leader
+    - name: decode-leader
+      spec:
+        roleName: decode-leader
+        replicas: 1
+        podSpec:
+          containers:
+          - name: decode-leader
+            image: nginx:latest
+            resources:
+              requests:
+                cpu: "1"
+                memory: "2Gi"
+    
+    # Decode workers
+    - name: decode-worker
+      spec:
+        roleName: decode-worker
+        replicas: 2
+        podSpec:
+          containers:
+          - name: decode-worker
+            image: nginx:latest
+            resources:
+              requests:
+                cpu: "2"
+                memory: "4Gi"
+    
+    # Define scaling groups
+    podCliqueScalingGroups:
+    # Prefill group: leader and workers scale together
+    - name: prefill
+      cliqueNames: [prefill-leader, prefill-worker]
+      replicas: 1
+      minAvailable: 1
+      # Note: Do NOT configure scaleConfig, use KEDA
+    
+    # Decode group: leader and workers scale together
+    - name: decode
+      cliqueNames: [decode-leader, decode-worker]
+      replicas: 1
+      minAvailable: 1
+      # Note: Do NOT configure scaleConfig, use KEDA
+
+---
+# KEDA ScaledObject for Prefill Group
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: prefill-group-scaler
+spec:
+  scaleTargetRef:
+    apiVersion: grove.io/v1alpha1
+    kind: PodCliqueScalingGroup
+    name: disaggregated-inference-0-prefill    # Format: {pcs-name}-{replica}-{group-name}
+  
+  minReplicaCount: 1
+  maxReplicaCount: 5
+  pollingInterval: 30
+  cooldownPeriod: 120
+  
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Pods
+            value: 1
+            periodSeconds: 120
+          selectPolicy: Min
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+          - type: Pods
+            value: 2
+            periodSeconds: 30
+          selectPolicy: Max
+  
+  triggers:
+  # Based on prefill queue depth
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc:9090
+      metricName: prefill_queue_depth
+      query: |
+        avg(prefill_queue_depth{
+          namespace="default",
+          group="prefill"
+        })
+      threshold: "50"
+      activationThreshold: "10"
+      ignoreNullValues: "true"
+  
+  # Based on prefill group's overall GPU utilization
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc:9090
+      metricName: prefill_gpu_util
+      query: |
+        avg(DCGM_FI_DEV_GPU_UTIL{
+          pod=~"disaggregated-inference-0-prefill-.*"
+        })
+      threshold: "85"
+      activationThreshold: "30"
+
+---
+# KEDA ScaledObject for Decode Group
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: decode-group-scaler
+spec:
+  scaleTargetRef:
+    apiVersion: grove.io/v1alpha1
+    kind: PodCliqueScalingGroup
+    name: disaggregated-inference-0-decode
+  
+  minReplicaCount: 1
+  maxReplicaCount: 8
+  pollingInterval: 30
+  cooldownPeriod: 180
+  
+  triggers:
+  # Based on decode queue depth
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc:9090
+      metricName: decode_queue_depth
+      query: |
+        avg(decode_queue_depth{
+          namespace="default",
+          group="decode"
+        })
+      threshold: "30"
+      activationThreshold: "5"
+      ignoreNullValues: "true"
+  
+  # Based on decode latency (P95)
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc:9090
+      metricName: decode_p95_latency
+      query: |
+        histogram_quantile(0.95,
+          sum(rate(decode_latency_bucket{
+            pod=~"disaggregated-inference-0-decode-.*"
+          }[5m])) by (le)
+        )
+      threshold: "0.5"              # Scale up when P95 latency exceeds 0.5 seconds
+      activationThreshold: "0.1"
+
+---
+# Verification Steps:
+# 
+# 1. Deploy PodCliqueSet
+#    kubectl apply -f 07-scaling-group.yaml
+# 
+# 2. Verify PodCliqueScalingGroup is created
+#    kubectl get pcsg
+#    # Should see:
+#    # - disaggregated-inference-0-prefill
+#    # - disaggregated-inference-0-decode
+# 
+# 3. Verify all PodCliques are created
+#    kubectl get pclq
+#    # Should see prefill and decode leaders and workers
+# 
+# 4. View ScaledObject status
+#    kubectl get scaledobject
+#    kubectl describe scaledobject prefill-group-scaler
+#    kubectl describe scaledobject decode-group-scaler
+# 
+# 5. Verify scale subresource
+#    kubectl get --raw /apis/grove.io/v1alpha1/namespaces/default/podcliquescalinggroups/disaggregated-inference-0-prefill/scale | jq
+# 
+# 6. Manually test scaling
+#    kubectl scale pcsg disaggregated-inference-0-prefill --replicas=2
+#    # Observe that both prefill-leader and prefill-worker increase replicas
+# 
+# 7. Simulate metrics to trigger KEDA scaling
+#    # Push test metrics to Prometheus
+# 
+# 8. Watch coordinated scaling
+#    watch kubectl get pcsg,pclq
+#    # When prefill group scales up, leader and all workers scale together
+# 
+# Understanding:
+# - Scaling PodCliqueScalingGroup scales all PodCliques in the group simultaneously
+# - If prefill group scales from 1 to 2, it creates a second complete set of prefill-leader and prefill-worker
+# - This ensures consistency in multi-node inference systems
+

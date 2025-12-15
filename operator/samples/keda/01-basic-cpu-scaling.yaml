@@ -1,0 +1,72 @@
+# Example 1: KEDA CPU-Based Scaling
+# This is the simplest KEDA integration example, showing how to use KEDA for CPU utilization-based scaling of PodClique
+
+---
+# Create PodCliqueSet (Note: do NOT configure autoScalingConfig)
+apiVersion: grove.io/v1alpha1
+kind: PodCliqueSet
+metadata:
+  name: keda-basic
+  labels:
+    app: keda-basic
+spec:
+  replicas: 1
+  template:
+    cliques:
+    - name: worker
+      spec:
+        roleName: worker
+        replicas: 1
+        # Note: Intentionally NOT configuring autoScalingConfig to let KEDA handle scaling
+        podSpec:
+          containers:
+          - name: worker
+            image: nginx:latest
+            resources:
+              requests:
+                cpu: 100m
+                memory: 128Mi
+              limits:
+                cpu: 200m
+                memory: 256Mi
+
+---
+# Create KEDA ScaledObject to scale the above PodClique
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: keda-basic-worker-scaler
+  namespace: default
+spec:
+  # Target: Grove's PodClique resource
+  scaleTargetRef:
+    apiVersion: grove.io/v1alpha1
+    kind: PodClique
+    name: keda-basic-0-worker    # Format: {pcs-name}-{replica-index}-{clique-name}
+  
+  # Scaling range
+  minReplicaCount: 1
+  maxReplicaCount: 5
+  
+  # KEDA configuration
+  pollingInterval: 15        # Check metrics every 15 seconds
+  cooldownPeriod: 60         # Wait 60 seconds after last scaling before scaling down
+  
+  # Scaling trigger: Based on CPU utilization
+  triggers:
+  - type: cpu
+    metricType: Utilization
+    metadata:
+      value: "50"             # Scale up when CPU utilization exceeds 50%
+
+---
+# Verification Steps:
+# 1. Deploy: kubectl apply -f 01-basic-cpu-scaling.yaml
+# 2. View resources: kubectl get pcs,pclq,scaledobject,hpa
+# 3. View ScaledObject status: kubectl describe scaledobject keda-basic-worker-scaler
+# 4. Generate CPU load to test scaling:
+#    POD=$(kubectl get pod -l grove.io/app-name=keda-basic-0-worker -o jsonpath='{.items[0].metadata.name}')
+#    kubectl exec -it $POD -- sh -c "dd if=/dev/zero of=/dev/null &"
+# 5. Watch scaling: kubectl get pclq keda-basic-0-worker -w
+# 6. Cleanup: kubectl delete -f 01-basic-cpu-scaling.yaml
+

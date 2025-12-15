@@ -1,0 +1,126 @@
+# Example 3: Scale-to-Zero
+# Shows how to scale PodClique down to 0 when there's no load, saving resource costs
+# Note: scale-to-zero may conflict with Grove's gang scheduling, use only for non-critical components
+
+---
+apiVersion: grove.io/v1alpha1
+kind: PodCliqueSet
+metadata:
+  name: scale-to-zero-demo
+spec:
+  replicas: 1
+  template:
+    cliques:
+    # This is a non-critical component that can scale to zero (e.g., dev environment worker)
+    - name: dev-worker
+      spec:
+        roleName: dev-worker
+        replicas: 1
+        minAvailable: 0          # Important: Allow 0 pods to run
+        podSpec:
+          containers:
+          - name: worker
+            image: nginx:latest
+            ports:
+            - containerPort: 8080
+            resources:
+              requests:
+                cpu: 100m
+                memory: 128Mi
+
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: scale-to-zero-scaler
+spec:
+  scaleTargetRef:
+    apiVersion: grove.io/v1alpha1
+    kind: PodClique
+    name: scale-to-zero-demo-0-dev-worker
+  
+  # Scale-to-zero configuration
+  minReplicaCount: 0              # Can scale down to 0
+  maxReplicaCount: 10
+  idleReplicaCount: 0             # Maintain 0 replicas when idle
+  
+  pollingInterval: 30
+  cooldownPeriod: 300             # Scale to 0 after 5 minutes of inactivity
+  
+  triggers:
+  # Based on request count
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc:9090
+      metricName: active_requests
+      query: |
+        sum(active_requests{
+          pod=~"scale-to-zero-demo-0-dev-worker-.*"
+        }) or vector(0)
+      threshold: "1"                # Scale up when 1 or more requests exist
+      activationThreshold: "0.1"    # Scale to 0 when below 0.1 requests
+
+---
+# Optional: Configure ScaledObject to handle scale-from-zero
+# After scaling to 0, can trigger scale up via HTTP requests
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: scale-to-zero-http-scaler
+spec:
+  scaleTargetRef:
+    apiVersion: grove.io/v1alpha1
+    kind: PodClique
+    name: scale-to-zero-demo-0-dev-worker
+  
+  minReplicaCount: 0
+  maxReplicaCount: 10
+  
+  triggers:
+  # HTTP request trigger
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc:9090
+      metricName: http_requests_rate
+      query: |
+        sum(rate(http_requests_total{
+          service="scale-to-zero-demo"
+        }[1m])) or vector(0)
+      threshold: "0.1"              # Scale up immediately when requests exist
+
+---
+# Usage Instructions:
+# 
+# Scale-to-zero workflow:
+# 1. Initial state: 1 pod running
+# 2. After 5 minutes of no requests: KEDA sets replicas to 0
+# 3. Grove operator deletes all pods
+# 4. When new requests arrive: KEDA detects metric > threshold
+# 5. KEDA sets replicas to 1 or more
+# 6. Grove operator creates new pods
+# 
+# Important Notes:
+# 1. ⚠️ Scaling up from 0 will have cold start latency (pod startup time)
+# 2. ⚠️ Do not use scale-to-zero on critical path components
+# 3. ⚠️ Ensure minAvailable is set to 0 or remove the field
+# 4. ⚠️ Be extra careful if PodClique is part of a PodCliqueScalingGroup
+# 
+# Verification Steps:
+# 1. Deploy
+#    kubectl apply -f 03-scale-to-zero.yaml
+# 
+# 2. Wait for pods to start
+#    kubectl get pods -l grove.io/app-name=scale-to-zero-demo-0-dev-worker -w
+# 
+# 3. Observe ScaledObject
+#    kubectl describe scaledobject scale-to-zero-scaler
+# 
+# 4. Wait 5 minutes (cooldownPeriod) and watch pods get deleted
+#    kubectl get pclq scale-to-zero-demo-0-dev-worker -w
+# 
+# 5. Simulate requests to trigger scale up
+#    # Push metrics to Prometheus or generate actual requests
+# 
+# 6. Watch pods being recreated
+#    kubectl get pods -l grove.io/app-name=scale-to-zero-demo-0-dev-worker -w
+
